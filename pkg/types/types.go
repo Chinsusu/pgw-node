@@ -43,6 +43,7 @@ type NodeHeartbeat struct {
 
 type MappingStatusReport struct {
 	MappingID   string `json:"mapping_id"`
+	ProxyID     string `json:"proxy_id"`
 	State       string `json:"state"`
 	ProxyStatus string `json:"proxy_status"`
 	LatencyMs   int    `json:"latency_ms"`

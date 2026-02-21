@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Chinsusu/pgw-node/internal/config"
@@ -98,17 +101,78 @@ func (s *Syncer) reconcileLocal(ctx context.Context, assignments *types.NodeAssi
 	// Tell local pgw-agent to reconcile (apply nft rules)
 	_, _ = s.client.Get(s.cfg.AgentURL + "/agent/reconcile")
 
-	// Build status reports (simplified: report all as APPLIED)
+	// Check each proxy from this node and build status reports
 	var reports []types.MappingStatusReport
 	for _, a := range assignments.Assignments {
+		status, latencyMs, exitIP := checkProxyFromNode(ctx, a.Proxy)
 		reports = append(reports, types.MappingStatusReport{
 			MappingID:   a.MappingID,
+			ProxyID:     a.Proxy.ID,
 			State:       "APPLIED",
-			ProxyStatus: string(a.Proxy.Status),
-			LatencyMs:   0,
+			ProxyStatus: string(status),
+			LatencyMs:   latencyMs,
+			ExitIP:      exitIP,
 		})
 	}
 	return reports
+}
+
+// checkProxyFromNode measures TCP latency to the proxy from this node VPS.
+// Returns (status, latencyMs, exitIP).
+func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, int, string) {
+	addr := fmt.Sprintf("%s:%d", p.Host, p.Port)
+	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+	elapsed := int(time.Since(start).Milliseconds())
+	if err != nil {
+		return types.StatusDown, 0, ""
+	}
+	conn.Close()
+
+	// Try to get exit IP via HTTP CONNECT through proxy (best-effort)
+	exitIP := fetchExitIPHTTP(ctx, p)
+
+	var status types.ProxyStatus
+	switch {
+	case elapsed < 500:
+		status = types.StatusOK
+	default:
+		status = types.StatusDown
+	}
+	return status, elapsed, exitIP
+}
+
+// fetchExitIPHTTP fetches the exit IP of the proxy via a HTTP request through it.
+func fetchExitIPHTTP(ctx context.Context, p types.Proxy) string {
+	proxyURL := fmt.Sprintf("http://%s:%d", p.Host, p.Port)
+	if p.Username != nil && p.Password != nil {
+		proxyURL = fmt.Sprintf("http://%s:%s@%s:%d", *p.Username, *p.Password, p.Host, p.Port)
+	}
+	transport := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(proxyURL)
+		},
+	}
+	client := &http.Client{Transport: transport, Timeout: 6 * time.Second}
+	reqCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://api.ipify.org?format=text", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
 }
 
 func (s *Syncer) sendHeartbeat(ctx context.Context, reports []types.MappingStatusReport) error {
