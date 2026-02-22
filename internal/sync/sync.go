@@ -147,57 +147,91 @@ func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, 
 	return status, elapsed, exitIP, region, isp
 }
 
-// fetchExitInfo fetches exit IP, region, and ISP through the proxy using ipinfo.io.
+// fetchExitInfo fetches exit IP, region, and ISP through the proxy using ip-api.com (plain HTTP).
+// Using HTTP (not HTTPS) so the proxy can handle it without needing a CONNECT tunnel.
 func fetchExitInfo(ctx context.Context, p types.Proxy) (exitIP, region, isp string) {
-	proxyURL := fmt.Sprintf("http://%s:%d", p.Host, p.Port)
+	proxyURL := &url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("%s:%d", p.Host, p.Port),
+	}
 	if p.Username != nil && p.Password != nil {
-		proxyURL = fmt.Sprintf("http://%s:%s@%s:%d", *p.Username, *p.Password, p.Host, p.Port)
+		proxyURL.User = url.UserPassword(*p.Username, *p.Password)
 	}
 	transport := &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse(proxyURL)
-		},
+		Proxy: http.ProxyURL(proxyURL),
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
-	client := &http.Client{Transport: transport, Timeout: 6 * time.Second}
-	reqCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://ipinfo.io/json", nil)
-	if err != nil {
-		return
+	client := &http.Client{Transport: transport, Timeout: 8 * time.Second}
+
+	// Step 1: Get exit IP via plain HTTP endpoint
+	ipEndpoints := []string{
+		"http://api.ipify.org?format=text",
+		"http://ifconfig.me/ip",
+		"http://icanhazip.com/",
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		// fallback: try plain IP
-		req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org?format=text", nil)
-		if req2 != nil {
-			if r2, err2 := client.Do(req2); err2 == nil {
-				defer r2.Body.Close()
-				body, _ := io.ReadAll(io.LimitReader(r2.Body, 64))
-				exitIP = strings.TrimSpace(string(body))
-			}
+	for _, ep := range ipEndpoints {
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, ep, nil)
+		if err != nil { cancel(); continue }
+		req.Header.Set("User-Agent", "pgw-node-check/1.0")
+		resp, err := client.Do(req)
+		cancel()
+		if err != nil { continue }
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			exitIP = strings.TrimSpace(string(body))
+			if exitIP != "" { break }
 		}
-		return
 	}
-	defer resp.Body.Close()
-	var info struct {
-		IP  string `json:"ip"`
-		Org string `json:"org"` // e.g. "AS12345 Some ISP"
-		Country string `json:"country"`
-		Region  string `json:"region"`
+	if exitIP == "" { return }
+
+	// Step 2: Geo lookup via ip-api.com (plain HTTP, no proxy needed — master does this directly)
+	geoCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	geoReq, err := http.NewRequestWithContext(geoCtx, http.MethodGet,
+		"http://ip-api.com/json/"+exitIP+"?fields=country,countryCode,regionName,isp", nil)
+	if err != nil { return }
+	geoReq.Header.Set("User-Agent", "pgw-node-geo/1.0")
+	geoResp, err := http.DefaultClient.Do(geoReq)
+	if err != nil { return }
+	defer geoResp.Body.Close()
+	var geo struct {
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		RegionName  string `json:"regionName"`
+		ISP         string `json:"isp"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&info); err != nil {
-		return
+	if err := json.NewDecoder(io.LimitReader(geoResp.Body, 4096)).Decode(&geo); err != nil { return }
+	if geo.CountryCode != "" {
+		flag := countryCodeToFlag(geo.CountryCode)
+		if geo.RegionName != "" && geo.RegionName != geo.Country {
+			region = flag + " " + geo.RegionName
+		} else if geo.Country != "" {
+			region = flag + " " + geo.Country
+		} else {
+			region = flag
+		}
+	} else if geo.Country != "" {
+		region = geo.Country
 	}
-	exitIP = info.IP
-	region = strings.TrimSpace(info.Country + " " + info.Region)
-	// Strip AS number prefix from org
-	isp = info.Org
-	if idx := strings.Index(isp, " "); idx != -1 {
-		isp = isp[idx+1:]
-	}
+	isp = geo.ISP
 	return
 }
+
+// countryCodeToFlag converts an ISO 3166-1 alpha-2 country code to a flag emoji.
+func countryCodeToFlag(code string) string {
+	if len(code) != 2 { return "" }
+	code = strings.ToUpper(code)
+	r1 := rune(0x1F1E6 + int(code[0]-'A'))
+	r2 := rune(0x1F1E6 + int(code[1]-'A'))
+	return string([]rune{r1, r2})
+}
+
 
 func (s *Syncer) sendHeartbeat(ctx context.Context, reports []types.MappingStatusReport) error {
 	hb := types.NodeHeartbeat{
