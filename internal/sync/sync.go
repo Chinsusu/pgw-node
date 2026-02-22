@@ -104,7 +104,7 @@ func (s *Syncer) reconcileLocal(ctx context.Context, assignments *types.NodeAssi
 	// Check each proxy from this node and build status reports
 	var reports []types.MappingStatusReport
 	for _, a := range assignments.Assignments {
-		status, latencyMs, exitIP := checkProxyFromNode(ctx, a.Proxy)
+		status, latencyMs, exitIP, region, isp := checkProxyFromNode(ctx, a.Proxy)
 		reports = append(reports, types.MappingStatusReport{
 			MappingID:   a.MappingID,
 			ProxyID:     a.Proxy.ID,
@@ -112,14 +112,16 @@ func (s *Syncer) reconcileLocal(ctx context.Context, assignments *types.NodeAssi
 			ProxyStatus: string(status),
 			LatencyMs:   latencyMs,
 			ExitIP:      exitIP,
+			Region:      region,
+			ISP:         isp,
 		})
 	}
 	return reports
 }
 
 // checkProxyFromNode measures TCP latency to the proxy from this node VPS.
-// Returns (status, latencyMs, exitIP).
-func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, int, string) {
+// Returns (status, latencyMs, exitIP, region, isp).
+func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, int, string, string, string) {
 	addr := fmt.Sprintf("%s:%d", p.Host, p.Port)
 	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
@@ -128,12 +130,12 @@ func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, 
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
 	elapsed := int(time.Since(start).Milliseconds())
 	if err != nil {
-		return types.StatusDown, 0, ""
+		return types.StatusDown, 0, "", "", ""
 	}
 	conn.Close()
 
-	// Try to get exit IP via HTTP CONNECT through proxy (best-effort)
-	exitIP := fetchExitIPHTTP(ctx, p)
+	// Try to get exit IP + region/ISP via proxy (best-effort)
+	exitIP, region, isp := fetchExitInfo(ctx, p)
 
 	var status types.ProxyStatus
 	switch {
@@ -142,11 +144,11 @@ func checkProxyFromNode(ctx context.Context, p types.Proxy) (types.ProxyStatus, 
 	default:
 		status = types.StatusDown
 	}
-	return status, elapsed, exitIP
+	return status, elapsed, exitIP, region, isp
 }
 
-// fetchExitIPHTTP fetches the exit IP of the proxy via a HTTP request through it.
-func fetchExitIPHTTP(ctx context.Context, p types.Proxy) string {
+// fetchExitInfo fetches exit IP, region, and ISP through the proxy using ipinfo.io.
+func fetchExitInfo(ctx context.Context, p types.Proxy) (exitIP, region, isp string) {
 	proxyURL := fmt.Sprintf("http://%s:%d", p.Host, p.Port)
 	if p.Username != nil && p.Password != nil {
 		proxyURL = fmt.Sprintf("http://%s:%s@%s:%d", *p.Username, *p.Password, p.Host, p.Port)
@@ -159,20 +161,42 @@ func fetchExitIPHTTP(ctx context.Context, p types.Proxy) string {
 	client := &http.Client{Transport: transport, Timeout: 6 * time.Second}
 	reqCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://api.ipify.org?format=text", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://ipinfo.io/json", nil)
 	if err != nil {
-		return ""
+		return
 	}
+	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return ""
+		// fallback: try plain IP
+		req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org?format=text", nil)
+		if req2 != nil {
+			if r2, err2 := client.Do(req2); err2 == nil {
+				defer r2.Body.Close()
+				body, _ := io.ReadAll(io.LimitReader(r2.Body, 64))
+				exitIP = strings.TrimSpace(string(body))
+			}
+		}
+		return
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-	if err != nil {
-		return ""
+	var info struct {
+		IP  string `json:"ip"`
+		Org string `json:"org"` // e.g. "AS12345 Some ISP"
+		Country string `json:"country"`
+		Region  string `json:"region"`
 	}
-	return strings.TrimSpace(string(body))
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&info); err != nil {
+		return
+	}
+	exitIP = info.IP
+	region = strings.TrimSpace(info.Country + " " + info.Region)
+	// Strip AS number prefix from org
+	isp = info.Org
+	if idx := strings.Index(isp, " "); idx != -1 {
+		isp = isp[idx+1:]
+	}
+	return
 }
 
 func (s *Syncer) sendHeartbeat(ctx context.Context, reports []types.MappingStatusReport) error {
